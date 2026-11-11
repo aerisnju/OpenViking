@@ -1849,3 +1849,110 @@ async def test_transfer_does_not_inspect_unrelated_chunk_shaped_entry():
     )
     assert result.written == 1
     assert backend.records["old"]["uri"] == target + "#chunk-1"
+
+
+class _WobblingBoundaryBackend(_RealAclMemoryTransferBackend):
+    """Repeat the first record of the 500-record page once.
+
+    Models a backend that pages by offset over a non-unique sort key: once a
+    scope grows past the stable-sort window, the page boundary shifts and one
+    record lands on two consecutive pages.
+    """
+
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        super().__init__(records)
+        self.wobble_count = 0
+
+    async def scroll(self, filter=None, limit=100, cursor=None, output_fields=None, *, ctx):
+        page, next_cursor = await super().scroll(
+            filter=filter,
+            limit=limit,
+            cursor=cursor,
+            output_fields=output_fields,
+            ctx=ctx,
+        )
+        # Every boundary page repeats its first record: ACL resolution may page
+        # the same scope first, and the scan under test must still hit it.
+        if cursor == "500" and page:
+            self.wobble_count += 1
+            page = [dict(page[0])] + page
+        return page, next_cursor
+
+
+@pytest.mark.asyncio
+async def test_strict_scan_collapses_record_repeated_across_pages():
+    backend = _MemoryTransferBackend(
+        [
+            _record("a", "viking://resources/x/a.md"),
+            _record("b", "viking://resources/x/b.md"),
+            _record("c", "viking://resources/x/c.md"),
+        ]
+    )
+    pages = [
+        [backend.records["a"], backend.records["b"]],
+        [backend.records["b"], backend.records["c"]],
+    ]
+    state = {"calls": 0}
+
+    async def paged(*_args, **_kwargs):
+        page = pages[state["calls"]]
+        state["calls"] += 1
+        next_cursor = None if state["calls"] == len(pages) else str(state["calls"])
+        return [dict(record) for record in page], next_cursor
+
+    backend._strict_transfer_page = paged
+    backend._strict_transfer_count = AsyncMock(return_value=3)
+
+    seen = [
+        record["id"]
+        async for record in backend._strict_scan(
+            _ctx(), None, output_fields=["id"], batch_size=2, what="test scan"
+        )
+    ]
+
+    assert seen == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_strict_scan_reports_incomplete_when_repeat_displaces_record():
+    backend = _MemoryTransferBackend(
+        [
+            _record("a", "viking://resources/x/a.md"),
+            _record("b", "viking://resources/x/b.md"),
+            _record("c", "viking://resources/x/c.md"),
+        ]
+    )
+    pages = [
+        [backend.records["a"], backend.records["b"]],
+        [backend.records["b"], backend.records["c"]],
+    ]
+    state = {"calls": 0}
+
+    async def paged(*_args, **_kwargs):
+        page = pages[state["calls"]]
+        state["calls"] += 1
+        next_cursor = None if state["calls"] == len(pages) else str(state["calls"])
+        return [dict(record) for record in page], next_cursor
+
+    backend._strict_transfer_page = paged
+    # Four records exist but the unstable boundary only surfaces three.
+    backend._strict_transfer_count = AsyncMock(return_value=4)
+
+    with pytest.raises(RuntimeError, match="ended after 3 of 4"):
+        async for _record_item in backend._strict_scan(
+            _ctx(), None, output_fields=["id"], batch_size=2, what="test scan"
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_incremental_inventory_survives_unstable_page_boundary():
+    root = "viking://resources/docs"
+    records = [_record(f"file-{i:03d}", f"{root}/{i:03d}.md", md5=f"md5-{i}") for i in range(600)]
+    backend = _WobblingBoundaryBackend(records)
+
+    inventory = await backend.get_incremental_inventory_under_uri(root, ctx=_ctx())
+
+    assert backend.wobble_count >= 1
+    assert len(inventory) == 600
+    assert inventory["file-599"]["md5"] == "md5-599"

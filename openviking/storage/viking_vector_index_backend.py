@@ -1831,12 +1831,21 @@ class VikingVectorIndexBackend:
         or dies before the total is reached — so a truncated scan can never look
         like "records absent". Per-record parsing/validation stays with the
         caller; this only guarantees the traversal is complete.
+
+        Cursors page by offset over a non-unique sort key (``updated_at``), so a
+        record can land on two consecutive pages once a scope grows past the
+        backend's stable-sort window. Such a repeat is collapsed here instead of
+        being handed to the caller, which treats a duplicate id as fatal. When
+        the repeat also displaced another record, the unique total falls short
+        of the pinned count and the completeness error below makes the caller
+        retry the whole scan.
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         expected_count = await self._strict_transfer_count(ctx, scope)
         cursor: Optional[str] = None
         scanned_count = 0
+        seen_ids: set[str] = set()
         seen_cursors: set[str] = set()
         while True:
             page, next_cursor = await self._strict_transfer_page(
@@ -1850,13 +1859,18 @@ class VikingVectorIndexBackend:
                 raise RuntimeError(
                     f"{what} ended after {scanned_count} of {expected_count} records"
                 )
-            scanned_count += len(page)
+            for record in page:
+                record_id = str(record.get("id") or "")
+                if record_id:
+                    if record_id in seen_ids:
+                        continue
+                    seen_ids.add(record_id)
+                scanned_count += 1
+                yield record
             if scanned_count > expected_count:
                 raise RuntimeError(
                     f"{what} returned {scanned_count} records but count was {expected_count}"
                 )
-            for record in page:
-                yield record
             if next_cursor is None:
                 if scanned_count == expected_count:
                     return
